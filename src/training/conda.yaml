@@ -1,0 +1,13 @@
+name: training-env
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch=2.4.*
+  - torchvision=0.19.*
+  - cpuonly
+  - pip:
+      - mlflow==2.18.*
+      - azureml-mlflow==1.58.*

@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# Secrets — Azure subscription IDs, API keys (use .env.example as template)
+.env
+.env.local
+.env.*.local
+
+# Data foundation (~megabytes locally, regenerable from raw sources via
+# the ingest CLIs; ~TB at full corpus scale — never committed)
+.data/
+
+# Local raw archives (gzipped SEC/news/etc. responses; ~GB at scale)
+raw/
+
+# Training artifacts
+checkpoints/
+runs/
+wandb/
+mlruns/
+lightning_logs/
+*.pt
+*.ckpt
+*.onnx
+
+# Local scratch
+/tmp/
+scratch/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code session-local (settings.local.json may carry per-machine
+# permission allowlists — keep machine-local)
+.claude/settings.local.json
