@@ -354,8 +354,14 @@ async def amain() -> None:
     ap.add_argument("--all", action="store_true", help="ingest every CIK in registry")
     ap.add_argument("--ciks", nargs="*", default=[], help="explicit CIKs (override --all)")
     ap.add_argument("--limit-ciks", type=int, default=0, help="cap registry slice (0 = all)")
-    ap.add_argument("--max-filings-per-cik", type=int, default=0,
-                    help="cap filings per modality per CIK (0 = no cap)")
+    # Default cap: 80 filings per modality per CIK. Spec target is ≥80 quarters
+    # of history, and SEC's submissions API returns newest-first, so taking
+    # the most-recent 80 covers ~20 years of 10-K/Q filings for active
+    # filers — exactly the temporal window the model cares about. Older
+    # filings (pre-2005 for many issuers) add little signal at high ingest
+    # cost. Use --max-filings-per-cik 0 to disable the cap explicitly.
+    ap.add_argument("--max-filings-per-cik", type=int, default=80,
+                    help="cap filings per modality per CIK (0 = no cap; default 80)")
     ap.add_argument("--concurrency", type=int, default=4,
                     help="number of CIKs processed in parallel (rate-limit is global)")
     ap.add_argument("--skip-financials", action="store_true")
@@ -370,10 +376,15 @@ async def amain() -> None:
     registry = EntityRegistry(storage)
 
     if args.ciks:
-        ciks = [c.zfill(10) for c in args.ciks]
+        # Even explicit user-passed CIKs get deduped — guards against typos
+        # or callers iterating a list with accidental dupes.
+        ciks = sorted({c.zfill(10) for c in args.ciks})
     elif args.all or args.limit_ciks > 0:
         df = registry.load()
-        ciks = sorted(df["cik"].astype(str).tolist())
+        # Dedup by CIK (defense in depth: even if seed_registry produces a
+        # registry with dupes for any reason — legacy data, partial reseed
+        # — the dispatcher never processes the same CIK twice in one run).
+        ciks = sorted(set(df["cik"].astype(str).tolist()))
         if args.limit_ciks > 0:
             ciks = ciks[: args.limit_ciks]
     else:
@@ -388,9 +399,19 @@ async def amain() -> None:
           f"{args.max_filings_per_cik if args.max_filings_per_cik else 'unlimited'}\n")
 
     sem = asyncio.Semaphore(args.concurrency)
+    completed_count = 0
+    error_count = 0
+    progress_lock = asyncio.Lock()
+    start_wall = time.monotonic()
+    total = len(ciks)
+    # Emit a [progress] line every PROGRESS_EVERY CIKs so the live AML log
+    # shows real-time pace + ETA, not just a wall of [OK] lines. Stage 5
+    # Hotfix observability addition (see plan § Stage 5 Hotfix).
+    PROGRESS_EVERY = max(1, total // 200) if total > 200 else 10
 
     async with edgar_client() as client:
         async def _one(cik: str) -> CikStats:
+            nonlocal completed_count, error_count
             async with sem:
                 s = await _process_cik(client, storage, pit, wm, cik, args)
                 tag = "OK" if not s.errors else f"ERR×{len(s.errors)}"
@@ -399,11 +420,31 @@ async def amain() -> None:
                     f"fin={s.financials_filings}/{s.financial_rows} "
                     f"f4={s.form4_filings}/{s.form4_trades} "
                     f"txt={s.text_filings}/{s.text_chunks} "
-                    f"in {s.elapsed_s:.1f}s"
+                    f"in {s.elapsed_s:.1f}s",
+                    flush=True,
                 )
                 if s.errors:
                     for e in s.errors[:3]:
-                        print(f"      → {e}")
+                        print(f"      → {e}", flush=True)
+                async with progress_lock:
+                    completed_count += 1
+                    if s.errors:
+                        error_count += 1
+                    n = completed_count
+                    if n % PROGRESS_EVERY == 0 or n == total:
+                        elapsed_h = (time.monotonic() - start_wall) / 3600
+                        pct = 100.0 * n / total
+                        pace = n / max(elapsed_h, 1e-6)  # CIKs/hour
+                        remaining_h = (total - n) / max(pace, 1e-6)
+                        err_pct = 100.0 * error_count / max(n, 1)
+                        print(
+                            f"[progress] {n}/{total} ({pct:.1f}%)  "
+                            f"pace={pace:.0f}/h  "
+                            f"errs={error_count} ({err_pct:.1f}%)  "
+                            f"elapsed={elapsed_h:.2f}h  "
+                            f"ETA={remaining_h:.1f}h",
+                            flush=True,
+                        )
                 return s
 
         all_stats = await asyncio.gather(*(_one(c) for c in ciks))

@@ -26,13 +26,43 @@ def fetch_sec_tickers(user_agent: str) -> list[dict]:
 
 
 def to_entities(rows: list[dict]) -> Iterator[Entity]:
+    """Yield one Entity per unique CIK.
+
+    SEC's `tickers.json` lists multiple ticker rows per CIK for issuers with
+    multiple share classes (Federal Home Loan Mortgage Corp has 25 ticker
+    entries for its 25 preferred series under one CIK; Bank of America, Fannie
+    Mae, ProShares ETF families similarly). The convention in `tickers.json`
+    is that the common-stock ticker appears first per CIK; for issuers with
+    multiple "common-like" tickers we additionally prefer the SHORTEST one,
+    since preferred-share tickers always carry a suffix (BAC-PB, BAC-PK, ...)
+    and ETF family symbols are typically longer than the parent's common.
+
+    This is the canonical dedup point — `EntityRegistry.write` then persists
+    one row per CIK. Downstream code (e.g. `ingest_edgar_full`) also dedups
+    defensively so a non-canonical registry doesn't reintroduce the dispatch
+    duplication that caused Stage 5's first --all run to do 30% redundant SEC
+    requests.
+    """
+    seen: dict[str, dict] = {}  # cik -> chosen-row
     for r in rows:
         cik = str(r["cik_str"]).zfill(10)
+        ticker = str(r.get("ticker", "") or "")
+        if cik not in seen:
+            seen[cik] = {"cik": cik, "name": r["title"], "ticker": ticker}
+            continue
+        # Already have an entry — prefer the shorter ticker (common stock
+        # tends to have the cleanest symbol; preferred shares carry suffixes).
+        if len(ticker) < len(seen[cik]["ticker"]):
+            seen[cik]["ticker"] = ticker
+            # Keep first-seen name (SEC's convention); name doesn't vary
+            # within a CIK anyway.
+    for cik in sorted(seen.keys()):
+        e = seen[cik]
         yield Entity(
             entity_id=EntityRegistry.entity_id_from_cik(cik),
-            name=r["title"],
+            name=e["name"],
             cik=cik,
-            ticker=r["ticker"],
+            ticker=e["ticker"],
             country="US",
         )
 

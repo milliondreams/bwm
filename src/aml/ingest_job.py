@@ -91,21 +91,27 @@ def main() -> None:
     ml = get_ml_client()
     compute_name = os.environ.get("AZUREML_COMPUTE_NAME", "cpu-cluster")
 
+    # Stage 5 Hotfix: --all defaults to --max-filings 80 to avoid the
+    # 14-day-runtime problem from the original unconfigured submission.
+    # 80 filings/modality covers ≥20 years (the spec FR target ≥80 quarters)
+    # since SEC submissions are returned newest-first.
     if args.pilot:
         scope_args = "--limit-ciks 10 --max-filings-per-cik 3"
         default_display = "edgar-ingest-pilot-10ciks"
+        output_subpath = "pilot"
     elif args.limit_ciks > 0:
         max_filings_arg = (
             f"--max-filings-per-cik {args.max_filings}" if args.max_filings > 0 else ""
         )
         scope_args = f"--limit-ciks {args.limit_ciks} {max_filings_arg}".strip()
         default_display = f"edgar-ingest-pilot-{args.limit_ciks}ciks"
+        output_subpath = "pilot"
     else:  # --all
-        max_filings_arg = (
-            f"--max-filings-per-cik {args.max_filings}" if args.max_filings > 0 else ""
-        )
-        scope_args = f"--all {max_filings_arg}".strip()
+        # Force the cap on for --all even if the operator forgot to pass it.
+        effective_cap = args.max_filings if args.max_filings > 0 else 80
+        scope_args = f"--all --max-filings-per-cik {effective_cap}"
         default_display = "edgar-ingest-full-corpus"
+        output_subpath = "v1"
 
     skip_flags: list[str] = []
     if args.skip_financials:
@@ -147,7 +153,15 @@ def main() -> None:
         environment=build_env(),
         compute=compute_name,
         outputs={
-            "data_root": Output(type="uri_folder", mode="rw_mount"),
+            # Named output path (R5: mid-run failure recovery). Pilots and
+            # `--all` write to separate paths so pilot data doesn't pollute
+            # the canonical, and re-submissions inherit watermarks from the
+            # prior run for true resumability.
+            "data_root": Output(
+                type="uri_folder",
+                path=f"azureml://datastores/workspaceblobstore/paths/bwm/data/{output_subpath}/",
+                mode="rw_mount",
+            ),
         },
         environment_variables={
             "SEC_USER_AGENT": os.environ.get(
