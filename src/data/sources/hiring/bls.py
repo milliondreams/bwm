@@ -115,14 +115,14 @@ def fetch_jolts_series(
             )
 
 
-# Curated NAICS 3-digit JOLTS series. seriesID encoding:
-# JTS + DataElement + Industry + Region + RateLevel + AdjustmentMethod
+# Curated NAICS supersector JOLTS series. seriesID encoding (BLS JOLTS):
+#   JT + Seasonal(S/U) + Industry(6) + State(2) + Area(5) + SizeClass(2) + DataElement(3)
+# = 21 chars total. Example: JTS000000000000000JOL = total nonfarm job openings, SA.
 # DataElement: JOL=Job Openings, HIL=Hires, TSL=Total Separations,
 #              QUL=Quits, LDL=Layoffs/Discharges (all are *Levels*)
-# Industry: 6-digit zero-padded NAICS code (we use 3-digit + trailing 000)
-# Region: 00 = total US
-# RateLevel: L = Level (not rate)
-# AdjustmentMethod: S = seasonally adjusted, U = not
+# State 00 + Area 00000 + SizeClass 00 = total US, all areas, all sizes.
+# Industry codes are JOLTS supersector codes (note: NOT NAICS 3-digit;
+# JOLTS uses its own coding listed at https://download.bls.gov/pub/time.series/jt/jt.industry).
 DEFAULT_NAICS_INDUSTRIES = [
     ("000000", "Total nonfarm"),
     ("110099", "Mining and logging"),
@@ -139,10 +139,13 @@ MEASURES = [("JOL", "job_openings"), ("HIL", "hires"), ("TSL", "total_separation
 
 
 def build_default_seriesids() -> list[tuple[str, str, str]]:
-    """Return [(series_id, naics_code, measure_name), ...] for the curated set."""
+    """Return [(series_id, industry_code, measure_name), ...] for the curated set.
+
+    seriesID format: JTS + industry(6) + 00 + 00000 + 00 + element(3) = 21 chars.
+    """
     out = []
     for naics, _ in DEFAULT_NAICS_INDUSTRIES:
         for code, name in MEASURES:
-            sid = f"JTS{code}{naics}000000LS"  # crude approximation; real seriesIDs vary
+            sid = f"JTS{naics}000000000{code}"  # JTS + 6 industry + 00 state + 00000 area + 00 sizeclass + 3 element
             out.append((sid, naics, name))
     return out
