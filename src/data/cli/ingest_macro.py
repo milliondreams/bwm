@@ -15,6 +15,7 @@ from datetime import date as date_cls
 
 import pandas as pd
 
+from data.observability.run_id import tag as _tag
 from data.pit.engine import PITEngine
 from data.schemas.macro_observation import MacroObservation
 from data.schemas.pit import Modality
@@ -45,7 +46,7 @@ def ingest_series(series_id: str, *, max_observations: int = 0) -> int:
     pit = PITEngine(storage)
     entity_id = f"fred:{series_id}"
     info = fetch_series_info(series_id)
-    print(f"  series: {series_id} — {info['title']} ({info['units']}, {info['frequency']})")
+    print(_tag(f"  series: {series_id} — {info['title']} ({info['units']}, {info['frequency']})"))
 
     vintages = list(fetch_vintages(series_id))
     if not vintages:
@@ -76,7 +77,7 @@ def ingest_series(series_id: str, *, max_observations: int = 0) -> int:
     pit.write(Modality.MACRO, df, partition_keys=MacroObservation.PARTITION_KEYS)
     log_parse(storage, f"fred-{series_id}", series_id, "macro",
               "ok_with_records", n_records=len(rows))
-    print(f"  wrote {len(rows):,} vintaged observations")
+    print(_tag(f"  wrote {len(rows):,} vintaged observations"))
     return len(rows)
 
 
@@ -95,7 +96,7 @@ def main() -> None:
         try:
             total += ingest_series(s, max_observations=args.max_observations)
         except Exception as e:  # noqa: BLE001
-            print(f"  ! {s}: {type(e).__name__}: {e}")
+            print(_tag(f"  ! {s}: {type(e).__name__}: {e}"))
     print(f"\ntotal rows written: {total:,}")
 
 

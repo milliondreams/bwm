@@ -33,6 +33,7 @@ import pandas as pd
 import requests
 
 from data.entity.registry import EntityRegistry
+from data.observability.run_id import tag as _tag
 from data.pit.engine import PITEngine
 from data.schemas.news_event import NewsEvent
 from data.schemas.pit import Modality
@@ -143,7 +144,7 @@ def main() -> None:
             pit.write(Modality.NEWS, df, partition_keys=NewsEvent.PARTITION_KEYS)
         log_parse(storage, "global", WM_SOURCE, "news",
                   "ok_with_records", n_records=buffered_rows)
-        print(f"  [flush] wrote {buffered_rows:,} rows across {len(buffer)} entities", flush=True)
+        print(_tag(f"  [flush] wrote {buffered_rows:,} rows across {len(buffer)} entities"), flush=True)
         buffer.clear()
         buffered_rows = 0
 
@@ -208,10 +209,12 @@ def main() -> None:
             pace = processed_slots / max(elapsed_h * 3600, 1e-6)  # slots/sec
             remaining = (total_slots - processed_slots) / max(pace, 1e-6) / 3600
             print(
-                f"[progress] slot {processed_slots}/{total_slots} ({100.0 * processed_slots / total_slots:.1f}%)  "
-                f"events={fetched_events:,} matched={matched_events:,} "
-                f"fetch_errs={fetch_errors} "
-                f"elapsed={elapsed_h:.2f}h ETA={remaining:.2f}h",
+                _tag(
+                    f"[progress] slot {processed_slots}/{total_slots} ({100.0 * processed_slots / total_slots:.1f}%)  "
+                    f"events={fetched_events:,} matched={matched_events:,} "
+                    f"fetch_errs={fetch_errors} "
+                    f"elapsed={elapsed_h:.2f}h ETA={remaining:.2f}h"
+                ),
                 flush=True,
             )
 

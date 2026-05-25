@@ -8,8 +8,12 @@ Run:
     uv run python -m data.cli.ingest_patents_all --limit-ciks 100
 
 Mirrors `ingest_edgar_full` patterns: dedup, asyncio semaphore, [progress]
-checkpoints, watermark-gated incremental ingest. PatentsView's free tier
-has historically rate-limited heavy use, so concurrency defaults to 2.
+checkpoints, watermark-gated incremental ingest. The USPTO connector enforces
+a process-wide token bucket at 0.75 req/s (PatentsView free-tier ceiling of
+45 req/min) with capacity=2 for small bursts, and retries 429/503 honoring
+`Retry-After`. Concurrency defaults to 2 — the bucket is the true bottleneck.
+Cross-process coordination is the orchestrator's job: only run one PatentsView
+job at a time.
 
 Each CIK resolves to an assignee name via the registry. PatentsView matches
 names case-insensitively against `assignee_organization`. Entities whose
@@ -31,6 +35,7 @@ from datetime import date as date_cls, timedelta
 import pandas as pd
 
 from data.entity.registry import EntityRegistry
+from data.observability.run_id import tag as _tag
 from data.pit.engine import PITEngine
 from data.schemas.patent import Patent
 from data.schemas.pit import Modality
@@ -156,7 +161,9 @@ def main() -> None:
     ap.add_argument("--start-grant", type=str, default="2000-01-01")
     ap.add_argument("--end-grant", type=str, default=date_cls.today().isoformat())
     ap.add_argument("--concurrency", type=int, default=2,
-                    help="number of CIKs in flight (PatentsView rate-limits heavy use)")
+                    help="number of CIKs in flight. The uspto connector enforces "
+                         "a 0.75 req/s process-wide token bucket (PatentsView free-tier "
+                         "ceiling), so concurrency only controls thread fan-out.")
     ap.add_argument("--max-patents-per-cik", type=int, default=0,
                     help="cap patents per CIK; 0 = no cap")
     args = ap.parse_args()
@@ -203,12 +210,12 @@ def main() -> None:
         async with sem:
             s = await _process_cik(storage, pit, wm, row, args,
                                    default_start, default_end)
-            tag = "OK" if not s.errors else f"ERR×{len(s.errors)}"
-            print(f"  [{tag}] cik={s.cik} assignee={s.assignee[:40]!r} patents={s.patents} in {s.elapsed_s:.1f}s",
+            status_tag = "OK" if not s.errors else f"ERR×{len(s.errors)}"
+            print(_tag(f"  [{status_tag}] cik={s.cik} assignee={s.assignee[:40]!r} patents={s.patents} in {s.elapsed_s:.1f}s"),
                   flush=True)
             if s.errors:
                 for e in s.errors[:3]:
-                    print(f"      → {e}", flush=True)
+                    print(_tag(f"      → {e}"), flush=True)
             async with progress_lock:
                 completed_count += 1
                 total_patents += s.patents
@@ -222,12 +229,14 @@ def main() -> None:
                     pace = n / max(elapsed_h, 1e-6)
                     remaining_h = (total - n) / max(pace, 1e-6)
                     print(
-                        f"[progress] {n}/{total} ({100.0 * n / total:.1f}%)  "
-                        f"pace={pace:.0f}/h  "
-                        f"errs={error_count}  "
-                        f"patents={total_patents:,}  "
-                        f"nonzero={nonzero_entities}  "
-                        f"elapsed={elapsed_h:.2f}h  ETA={remaining_h:.1f}h",
+                        _tag(
+                            f"[progress] {n}/{total} ({100.0 * n / total:.1f}%)  "
+                            f"pace={pace:.0f}/h  "
+                            f"errs={error_count}  "
+                            f"patents={total_patents:,}  "
+                            f"nonzero={nonzero_entities}  "
+                            f"elapsed={elapsed_h:.2f}h  ETA={remaining_h:.1f}h"
+                        ),
                         flush=True,
                     )
             return s

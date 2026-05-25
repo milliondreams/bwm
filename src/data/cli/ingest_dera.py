@@ -43,6 +43,7 @@ import pandas as pd
 
 from data.entity.registry import EntityRegistry
 from data.observability.log import emit_event, emit_start, emit_end
+from data.observability.run_id import tag as _tag
 from data.observability.resources import preflight
 from data.pit.engine import PITEngine
 from data.schemas.financial import FinancialFact
@@ -141,10 +142,13 @@ def _ingest_quarter(
             batch.sort_values("availability_date").iloc[-1]["source_ref"]
         )
         try:
-            watermark.update(cik10, WM_SOURCE, latest_accn, latest)
-        except Exception:
-            # Watermark update is best-effort; ingest itself succeeded
-            pass
+            watermark.set(cik10, WM_SOURCE, latest_accn, latest)
+        except Exception as e:  # noqa: BLE001
+            # Watermark write failed but the canonical write already succeeded.
+            # Surface in the parse log so resumability bugs are visible instead
+            # of silently re-fetching the whole history next run.
+            log_parse(storage, cik10, latest_accn or "", "dera",
+                      "parse_failed", error_message=f"watermark_set: {e}")
 
     stats.status = "ok_with_records"
     stats.elapsed_s = time.monotonic() - t0
@@ -246,14 +250,14 @@ def main() -> None:
         )
         pace = i / max(time.monotonic() - t_start, 1e-9) * 3600  # quarters/hour
         eta_h = (len(quarters) - i) / max(pace, 1e-9)
-        print(
+        print(_tag(
             f"[{i}/{len(quarters)}] {q} status={stats.status} "
             f"rows={stats.rows_written:>9,} ciks={stats.ciks_touched:>5} "
             f"dl={stats.download_bytes/1e6:>6.1f}MB "
             f"wall={stats.elapsed_s:>5.1f}s "
             f"pace={pace:.1f}/h eta={eta_h:.2f}h"
             + (f" ERR={stats.error[:80]}" if stats.error else "")
-        )
+        ))
 
     wall = time.monotonic() - t_start
     emit_end(PIPELINE, "financials", "ok_with_records", job_id, wall,

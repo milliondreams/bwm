@@ -38,6 +38,7 @@ from datetime import date
 import pandas as pd
 
 from data.entity.registry import EntityRegistry
+from data.observability.run_id import tag as _tag
 from data.pit.engine import PITEngine
 from data.schemas.filing_text import FilingTextChunk
 from data.schemas.financial import FinancialFact
@@ -414,18 +415,20 @@ async def amain() -> None:
             nonlocal completed_count, error_count
             async with sem:
                 s = await _process_cik(client, storage, pit, wm, cik, args)
-                tag = "OK" if not s.errors else f"ERR×{len(s.errors)}"
+                status_tag = "OK" if not s.errors else f"ERR×{len(s.errors)}"
                 print(
-                    f"  [{tag}] cik={s.cik}  "
-                    f"fin={s.financials_filings}/{s.financial_rows} "
-                    f"f4={s.form4_filings}/{s.form4_trades} "
-                    f"txt={s.text_filings}/{s.text_chunks} "
-                    f"in {s.elapsed_s:.1f}s",
+                    _tag(
+                        f"  [{status_tag}] cik={s.cik}  "
+                        f"fin={s.financials_filings}/{s.financial_rows} "
+                        f"f4={s.form4_filings}/{s.form4_trades} "
+                        f"txt={s.text_filings}/{s.text_chunks} "
+                        f"in {s.elapsed_s:.1f}s"
+                    ),
                     flush=True,
                 )
                 if s.errors:
                     for e in s.errors[:3]:
-                        print(f"      → {e}", flush=True)
+                        print(_tag(f"      → {e}"), flush=True)
                 async with progress_lock:
                     completed_count += 1
                     if s.errors:
@@ -438,11 +441,13 @@ async def amain() -> None:
                         remaining_h = (total - n) / max(pace, 1e-6)
                         err_pct = 100.0 * error_count / max(n, 1)
                         print(
-                            f"[progress] {n}/{total} ({pct:.1f}%)  "
-                            f"pace={pace:.0f}/h  "
-                            f"errs={error_count} ({err_pct:.1f}%)  "
-                            f"elapsed={elapsed_h:.2f}h  "
-                            f"ETA={remaining_h:.1f}h",
+                            _tag(
+                                f"[progress] {n}/{total} ({pct:.1f}%)  "
+                                f"pace={pace:.0f}/h  "
+                                f"errs={error_count} ({err_pct:.1f}%)  "
+                                f"elapsed={elapsed_h:.2f}h  "
+                                f"ETA={remaining_h:.1f}h"
+                            ),
                             flush=True,
                         )
                 return s

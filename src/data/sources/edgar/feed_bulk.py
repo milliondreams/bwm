@@ -66,6 +66,8 @@ from typing import Iterator
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from data.sources.edgar.form4 import ParsedForm4, parse_form4_filing
+
 SEC_USER_AGENT = "BWM Research rohit@dragonscale.ai"
 FEED_URL_TMPL = (
     "https://www.sec.gov/Archives/edgar/Feed/{year}/QTR{q}/{yyyymmdd}.nc.tar.gz"
@@ -333,6 +335,29 @@ def filings_to_rows(filings: Iterator[FeedFiling]) -> Iterator[dict]:
                 "sha256": hashlib.sha256(doc.content_bytes).hexdigest(),
                 "all_ciks_json": ",".join(f.all_ciks),
             }
+
+
+FORM4_FORMS = ("4", "4/A")
+
+
+def extract_form4(filing: FeedFiling) -> ParsedForm4 | None:
+    """If `filing` is a Form 4 / 4/A, parse its ownership XML into trades.
+
+    Form 4 filings carry the structured `<ownershipDocument>` as one of the
+    DOCUMENT blocks (usually a `.xml` primary). We scan documents in order and
+    return the first parse that yields at least one trade. Returns None for
+    non-Form-4 filings, malformed XML, or filings with zero recognizable
+    transactions (e.g. a Form 4 that reports only a position-disclosure).
+    """
+    if filing.form not in FORM4_FORMS:
+        return None
+    for doc in filing.documents:
+        if b"<ownershipDocument" not in doc.content_bytes:
+            continue
+        parsed = parse_form4_filing(doc.content_bytes)
+        if parsed is not None and parsed.trades:
+            return parsed
+    return None
 
 
 def _guess_mime(filename: str, doc_type: str) -> str:

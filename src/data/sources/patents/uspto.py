@@ -13,17 +13,79 @@ Limitations of v1 in this connector:
     follows the page chain.
   - Patent invalidations and post-grant reviews are not tracked (would
     require USPTO PTAB data, separate source).
+
+Rate limiting:
+  PatentsView's free tier is documented at 45 requests/minute (0.75 req/s).
+  We enforce a process-wide token bucket at 0.75 req/s with a capacity of 2
+  to absorb short bursts (one token per outbound POST). On 429 / 503 the
+  connector honors the `Retry-After` header (capped at 60s) and retries up
+  to 4 times with exponential backoff + jitter.
+
+  Cross-process coordination (multiple parallel jobs) is the orchestrator's
+  responsibility — at most one PatentsView job should be active at a time.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import date
 from typing import Iterator, Optional
 
 import requests
+from tenacity import (
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
+
+from data.sources._throttle import TokenBucket
 
 PATENTSVIEW_URL = "https://api.patentsview.org/patents/query"
+
+# 0.75 req/s == 45 req/min (documented free-tier ceiling). Capacity=2 allows
+# a small burst before the bucket throttles.
+_BUCKET = TokenBucket(rate=0.75, capacity=2.0)
+
+_RETRY_STATUS = (429, 503)
+_MAX_RETRY_AFTER_S = 60.0
+
+
+class _RetryableHTTPError(Exception):
+    """Internal marker for 429/503 responses so tenacity retries cleanly."""
+
+
+def _post_with_retry(payload: dict, headers: dict, timeout_s: float) -> dict:
+    for attempt in Retrying(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential_jitter(initial=1.0, max=30.0),
+        retry=retry_if_exception_type(
+            (_RetryableHTTPError, requests.ConnectionError, requests.Timeout)
+        ),
+        reraise=True,
+    ):
+        with attempt:
+            _BUCKET.acquire()
+            resp = requests.post(
+                PATENTSVIEW_URL,
+                json=payload,
+                headers=headers,
+                timeout=timeout_s,
+            )
+            if resp.status_code in _RETRY_STATUS:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        wait_s = min(float(retry_after), _MAX_RETRY_AFTER_S)
+                    except ValueError:
+                        wait_s = 5.0
+                    import time as _time
+                    _time.sleep(wait_s)
+                raise _RetryableHTTPError(
+                    f"status={resp.status_code} retry-after={retry_after!r}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 @dataclass(frozen=True)
@@ -87,14 +149,11 @@ def fetch_patents_by_assignee(
     page_size = options["per_page"]
     while True:
         options["page"] = page
-        resp = requests.post(
-            PATENTSVIEW_URL,
-            json={"q": query, "f": fields, "o": options},
+        data = _post_with_retry(
+            {"q": query, "f": fields, "o": options},
             headers=headers,
-            timeout=timeout_s,
+            timeout_s=timeout_s,
         )
-        resp.raise_for_status()
-        data = resp.json()
         patents = data.get("patents") or []
         if not patents:
             return

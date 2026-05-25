@@ -25,6 +25,7 @@ from datetime import date as date_cls
 
 import pandas as pd
 
+from data.observability.run_id import tag as _tag
 from data.pit.engine import PITEngine
 from data.schemas.hiring_observation import HiringObservation
 from data.schemas.pit import Modality
@@ -92,13 +93,13 @@ def main() -> None:
                 )
             )
         except Exception as e:  # noqa: BLE001
-            print(f"  [ERR] chunk {chunk_idx}: {type(e).__name__}: {e}")
+            print(_tag(f"  [ERR] chunk {chunk_idx}: {type(e).__name__}: {e}"))
             log_parse(
                 storage, "bls", f"chunk-{chunk_idx}", "hiring",
                 "fetch_failed", error_message=f"{type(e).__name__}: {e}",
             )
             continue
-        print(f"  chunk {chunk_idx}: {len(sid_chunk)} series → {len(observations)} obs")
+        print(_tag(f"  chunk {chunk_idx}: {len(sid_chunk)} series → {len(observations)} obs"))
         for obs in observations:
             meta = series_meta.get(obs.series_id)
             if meta is None:
@@ -132,7 +133,7 @@ def main() -> None:
             "ok_with_records", n_records=len(rows),
         )
         total_series_with_data += 1
-        print(f"  [OK] {entity_id}: wrote {len(rows):,} observations")
+        print(_tag(f"  [OK] {entity_id}: wrote {len(rows):,} observations"))
 
     # Report which requested series returned nothing.
     requested_entities = {f"bls:naics-{naics}" for (_, naics, _) in series_tuples}

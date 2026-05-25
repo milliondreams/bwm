@@ -30,6 +30,19 @@ partitioned by source key (`yahoo_finance`, `patentsview`, `gdelt:events2`,
 IMPORTANT: do not submit while an EDGAR `--all` job is still running.
 EDGAR is the single largest writer to this namespace; parallel writers
 should wait until it completes or stabilizes.
+
+Per-modality concurrency constraint (cross-process rate-limit coordination
+is NOT enforced in code — these caps live in per-job token buckets):
+
+  - Yahoo market (`yahoo_finance`): at most ONE job active at a time. The
+    connector enforces 4 req/s per process; two parallel jobs become 8 req/s
+    and risk IP bans.
+  - PatentsView (`patentsview`): at most ONE job active at a time. The
+    connector enforces 0.75 req/s per process (free-tier ceiling); two
+    parallel jobs would trip 429 throttling.
+
+EDGAR, FRED, BLS, and GDELT have either process-wide async buckets (EDGAR)
+or low/no documented limits and can be parallelized freely.
 """
 from __future__ import annotations
 
@@ -89,6 +102,32 @@ def _build_modality_cmd(args) -> str:
     raise ValueError(f"unknown modality: {m}")
 
 
+# Per-modality env vars. REQUIRED secrets fail-fast at submit time so we don't
+# burn ~30 min of compute spin-up before discovering them missing.
+_REQUIRED_ENV: dict[str, tuple[str, ...]] = {
+    "macro": ("FRED_API_KEY",),  # fred.py raises without it
+}
+_RECOMMENDED_ENV: dict[str, tuple[str, ...]] = {
+    "hiring": ("BLS_API_KEY",),          # 50 vs 25 req/day with key
+    "patents": ("PATENTSVIEW_API_KEY",), # higher quota with key
+}
+
+
+def _check_env(modality: str) -> None:
+    missing = [k for k in _REQUIRED_ENV.get(modality, ()) if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(
+            f"missing required env var(s) for modality={modality}: "
+            f"{', '.join(missing)}. Export them and re-submit."
+        )
+    soft = [k for k in _RECOMMENDED_ENV.get(modality, ()) if not os.environ.get(k)]
+    if soft:
+        print(
+            f"[warn] {modality} job: {', '.join(soft)} unset — using anon "
+            f"quota (lower rate limit)."
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--modality", required=True,
@@ -111,6 +150,8 @@ def main() -> None:
 
     ap.add_argument("--display-name", default="")
     args = ap.parse_args()
+
+    _check_env(args.modality)
 
     ml = get_ml_client()
     compute_name = os.environ.get("AZUREML_COMPUTE_NAME", "cpu-cluster")

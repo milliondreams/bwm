@@ -15,10 +15,12 @@ per-CIK [OK]/[ERR] lines, periodic [progress] line with pace + ETA,
 WatermarkStore-gated incremental ingest.
 
 Yfinance is synchronous; we wrap each per-CIK fetch in `asyncio.to_thread`
-so the semaphore limits the number of concurrent web scrapes. Yahoo has no
-documented rate limit but practical experience caps sustained throughput
-around 5 req/s before IP bans — `--concurrency 4` (default) stays well
-under that.
+so the semaphore limits the number of concurrent web scrapes. The Yahoo
+connector enforces a process-wide token bucket at 4 req/s (see
+`data.sources.market.yahoo`), so the bucket — not the semaphore — is the
+true bottleneck. We default `--concurrency 2` to keep a couple of threads
+warm without thrashing while the bucket throttles. Cross-process
+coordination is the orchestrator's job: only run one Yahoo job at a time.
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ from datetime import date as date_cls, timedelta
 import pandas as pd
 
 from data.entity.registry import EntityRegistry
+from data.observability.run_id import tag as _tag
 from data.pit.engine import PITEngine
 from data.schemas.market_bar import MarketBar
 from data.schemas.pit import Modality
@@ -156,9 +159,10 @@ def main() -> None:
     ap.add_argument("--start", type=str, default="2015-01-01")
     ap.add_argument("--end", type=str, default=date_cls.today().isoformat())
     ap.add_argument("--interval", default="1d", choices=("1d", "1wk", "1mo"))
-    ap.add_argument("--concurrency", type=int, default=4,
-                    help="number of CIKs in flight (yfinance has no documented rate limit; "
-                         "stay ≤5 to avoid IP bans)")
+    ap.add_argument("--concurrency", type=int, default=2,
+                    help="number of CIKs in flight. The yahoo connector enforces "
+                         "a 4 req/s process-wide token bucket, so concurrency only "
+                         "controls thread fan-out; the bucket caps the actual rate.")
     ap.add_argument("--max-bars-per-cik", type=int, default=0,
                     help="cap bars per CIK; 0 = no cap (keep most-recent N if >0)")
     args = ap.parse_args()
@@ -206,12 +210,12 @@ def main() -> None:
         async with sem:
             s = await _process_cik(storage, pit, wm, row, args,
                                    default_start, default_end, freq_label)
-            tag = "OK" if not s.errors else f"ERR×{len(s.errors)}"
-            print(f"  [{tag}] cik={s.cik} ticker={s.ticker} bars={s.bars} in {s.elapsed_s:.1f}s",
+            status_tag = "OK" if not s.errors else f"ERR×{len(s.errors)}"
+            print(_tag(f"  [{status_tag}] cik={s.cik} ticker={s.ticker} bars={s.bars} in {s.elapsed_s:.1f}s"),
                   flush=True)
             if s.errors:
                 for e in s.errors[:3]:
-                    print(f"      → {e}", flush=True)
+                    print(_tag(f"      → {e}"), flush=True)
             async with progress_lock:
                 completed_count += 1
                 total_bars += s.bars
@@ -223,11 +227,13 @@ def main() -> None:
                     pace = n / max(elapsed_h, 1e-6)
                     remaining_h = (total - n) / max(pace, 1e-6)
                     print(
-                        f"[progress] {n}/{total} ({100.0 * n / total:.1f}%)  "
-                        f"pace={pace:.0f}/h  "
-                        f"errs={error_count} ({100.0 * error_count / max(n, 1):.1f}%)  "
-                        f"bars={total_bars:,}  "
-                        f"elapsed={elapsed_h:.2f}h  ETA={remaining_h:.1f}h",
+                        _tag(
+                            f"[progress] {n}/{total} ({100.0 * n / total:.1f}%)  "
+                            f"pace={pace:.0f}/h  "
+                            f"errs={error_count} ({100.0 * error_count / max(n, 1):.1f}%)  "
+                            f"bars={total_bars:,}  "
+                            f"elapsed={elapsed_h:.2f}h  ETA={remaining_h:.1f}h"
+                        ),
                         flush=True,
                     )
             return s
