@@ -17,7 +17,7 @@ class TestPipelineConstruction:
         nodes = set(p.jobs.keys())
         expected = {
             "dera", "feed", "market", "macro", "patents", "news", "hiring",
-            "earnings_calls", "constraints", "coverage",
+            "finalize", "earnings_calls", "constraints", "coverage",
         }
         assert expected <= nodes, f"missing nodes: {expected - nodes}"
 
@@ -56,15 +56,18 @@ class TestStepCommands:
         assert "ingest_feed" in feed_cmd
         assert "--start" in feed_cmd and "--end" in feed_cmd
 
-    def test_validate_steps_have_fallback_true(self):
-        """validate_* nodes use `|| true` so they don't fail the pipeline if
-        called before Wave 1 finishes (operator re-runs them via CLI).
+    def test_validate_steps_no_longer_use_fallback_true(self):
+        """A2.6-3: with wave_ready sentinel DAG edges, validators run only
+        after Wave 1+2 complete, so `|| true` is no longer needed and would
+        in fact mask real failures.
         """
         from aml.pipelines.phase_a2_v2 import _build_pipeline
         p = _build_pipeline()
         for name in ("constraints", "coverage"):
             cmd = p.jobs[name].command
-            assert "|| true" in cmd
+            assert "|| true" not in cmd, (
+                f"{name} command still has `|| true`: {cmd}"
+            )
 
 
 class TestStepOutputs:
@@ -87,6 +90,7 @@ class TestStepTimeouts:
     EXPECTED = {
         "dera": 7200, "feed": 86400, "market": 3600, "macro": 1800,
         "patents": 14400, "news": 86400, "hiring": 1800,
+        "finalize": 300,
         "earnings_calls": 1800, "constraints": 600, "coverage": 600,
     }
 
@@ -106,4 +110,61 @@ class TestStepTimeouts:
             actual = node.limits.timeout
             assert actual == expected, (
                 f"{node_name}: expected timeout {expected}s, got {actual}s"
+            )
+
+
+class TestWaveReadyDag:
+    """A2.6-3: wave_ready sentinel DAG edges replace the previous
+    `|| true` ordering hack. finalize_wave1 gates all Wave 1 outputs,
+    earnings_calls gates on finalize, validators gate on earnings_calls.
+    """
+
+    def test_finalize_node_emits_wave_ready(self):
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        assert "finalize" in p.jobs
+        assert "wave_ready" in p.jobs["finalize"].outputs
+
+    def test_finalize_consumes_all_wave1_outputs(self):
+        """finalize_wave1's inputs must include one per Wave 1 step so AML
+        schedules it after all of them complete.
+        """
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        finalize_inputs = set(p.jobs["finalize"].inputs.keys())
+        expected = {"dera_root", "feed_root", "market_root", "macro_root",
+                    "patents_root", "news_root", "hiring_root"}
+        assert expected <= finalize_inputs, (
+            f"finalize missing wave1 inputs: {expected - finalize_inputs}"
+        )
+
+    def test_earnings_calls_consumes_wave_ready(self):
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        assert "wave_ready" in p.jobs["earnings_calls"].inputs
+
+    def test_earnings_calls_emits_wave_ready(self):
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        # earnings_calls also emits wave_ready so validators gate on its
+        # completion (and thus the derived modality being present).
+        assert "wave_ready" in p.jobs["earnings_calls"].outputs
+
+    def test_validators_consume_wave_ready(self):
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        for name in ("constraints", "coverage"):
+            assert "wave_ready" in p.jobs[name].inputs, (
+                f"{name} missing wave_ready input"
+            )
+
+    def test_wave1_nodes_have_no_wave_ready_input(self):
+        """Sanity: Wave 1 ingest nodes must NOT depend on wave_ready
+        (would be a circular dependency).
+        """
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        for name in ("dera", "feed", "market", "macro", "patents", "news", "hiring"):
+            assert "wave_ready" not in (p.jobs[name].inputs or {}), (
+                f"{name} (Wave 1) must not depend on wave_ready"
             )

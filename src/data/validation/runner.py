@@ -51,7 +51,8 @@ class ConstraintRunner:
         # concept names" silently).
         for rule in ACCOUNTING_RULES + REGULATION_RULES:
             report.per_rule[rule.name] = RuleResult(
-                rule_name=rule.name, module=rule.module, severity=rule.severity
+                rule_name=rule.name, module=rule.module, severity=rule.severity,
+                modality=rule.modality,
             )
 
         entity_files = self._enumerate_entity_files(entity_ids)

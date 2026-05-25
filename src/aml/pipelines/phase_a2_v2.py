@@ -87,27 +87,63 @@ _STEP_TIMEOUTS: dict[str, int] = {
     "ingest_patents": 14400,              # 4h — PatentsView rate-limited
     "ingest_news": 86400,                 # 24h — GDELT ~390K slots serial
     "ingest_hiring": 1800,                # 30m — BLS batched, <2 min observed
+    "finalize_wave1": 300,                # 5m — write sentinel timestamp file
     "derive_earnings_calls": 1800,        # 30m — pure CPU on existing canonical
     "validate_constraints": 600,          # 10m — read + rule eval
     "validate_modality_coverage": 600,    # 10m — list + per-modality sample
 }
 
 
-def _step(name: str, command_str: str, compute: str = "cpu-cluster",
-          timeout_seconds: int | None = None):
+def _step(
+    name: str,
+    command_str: str,
+    compute: str = "cpu-cluster",
+    timeout_seconds: int | None = None,
+    *,
+    wave_inputs: dict | None = None,
+    wave_ready_input=None,
+    emit_wave_ready: bool = False,
+):
     """Build a command component and immediately invoke it as a pipeline node.
 
-    AML's dsl.pipeline registers nodes when a component is *called*; the
-    component returned by `command(...)` is just a definition. Calling it
-    `()` produces a Node that the active pipeline context captures.
+    AML's dsl.pipeline expresses dependency edges via I/O piping (no
+    `.after()` API). We use two patterns:
 
-    `timeout_seconds` enforces a wall-clock limit on the step. If not
-    explicitly passed, the per-step default from _STEP_TIMEOUTS is used.
+    - `wave_inputs={"name": upstream_node.outputs.data_root, ...}` — declares
+      placeholder folder inputs on this node that AML wires to upstream
+      outputs, forcing it to schedule this node after all upstreams.
+    - `emit_wave_ready=True` — adds a `wave_ready` uri_file Output and writes
+      a timestamp to it (used by the finalize_wave1 step).
+    - `wave_ready_input=upstream.outputs.wave_ready` — declares a `wave_ready`
+      Input file, making this node wait for the finalizer.
+
+    `timeout_seconds` enforces a wall-clock limit. If None, falls back to
+    the per-step default from _STEP_TIMEOUTS.
     """
     env = _ingest_env()
     env_vars = {**_BASE_ENV, **_api_keys()}
     if timeout_seconds is None:
         timeout_seconds = _STEP_TIMEOUTS.get(name)
+
+    inputs: dict = {}
+    if wave_inputs:
+        for in_name in wave_inputs:
+            inputs[in_name] = Input(type="uri_folder", mode="ro_mount")
+    if wave_ready_input is not None:
+        inputs["wave_ready"] = Input(type="uri_file", mode="ro_mount")
+
+    outputs: dict = {
+        "data_root": Output(
+            type="uri_folder",
+            path=DATA_ROOT_URI,
+            mode="rw_mount",
+        ),
+    }
+    if emit_wave_ready:
+        # No explicit path → AML auto-assigns a per-job uri_file path; the
+        # downstream consumer mounts it ro_mount via inputs["wave_ready"].
+        outputs["wave_ready"] = Output(type="uri_file")
+
     component = command(
         name=name,
         display_name=name,
@@ -120,18 +156,19 @@ def _step(name: str, command_str: str, compute: str = "cpu-cluster",
         ]),
         environment=env,
         compute=compute,
-        outputs={
-            "data_root": Output(
-                type="uri_folder",
-                path=DATA_ROOT_URI,
-                mode="rw_mount",
-            ),
-        },
+        inputs=inputs,
+        outputs=outputs,
         environment_variables=env_vars,
         timeout=timeout_seconds,
     )
-    # Invoke the component → registers a node in the active pipeline context.
-    return component()
+    # Invoke the component, passing wave-input bindings so AML wires the
+    # dependency edges. wave_inputs map an Input name → upstream Output.
+    call_kwargs = {}
+    if wave_inputs:
+        call_kwargs.update(wave_inputs)
+    if wave_ready_input is not None:
+        call_kwargs["wave_ready"] = wave_ready_input
+    return component(**call_kwargs)
 
 
 @dsl.pipeline(
@@ -185,30 +222,48 @@ def _build_pipeline(
         "python -m data.cli.ingest_hiring --start-year 2015 --end-year 2026",
     )
 
-    # Wave 2 / Wave 3 ordering note:
-    # AML dsl.pipeline expresses dependencies via input/output piping;
-    # there is no `.after()` API. All ingest steps write to the SAME shared
-    # blob mount (different canonical subtrees) so they don't have piped
-    # outputs to consume. We include Wave 2 (derive) and Wave 3 (validate)
-    # steps in this pipeline anyway; AML will start them in parallel with
-    # Wave 1. The operator is expected to:
-    #   1. Submit this pipeline.
-    #   2. If derive/validate fail because Wave 1 isn't done yet, re-submit
-    #      them via the standalone validate_constraints / derive_earnings_calls
-    #      CLIs after Wave 1 completes.
-    # A future improvement is to add a `_wave_ready` sentinel output that
-    # downstream steps consume as an input, materializing the DAG explicitly.
-    earnings_calls = _step(  # noqa: F841 — included for AML graph completeness
-        "derive_earnings_calls",
-        "python -m data.cli.derive_earnings_calls",
+    # Wave 1 barrier: finalize_wave1 takes every Wave 1 node's data_root as
+    # an input, forcing AML to schedule it after all of them complete. It
+    # emits a `wave_ready` uri_file that Wave 2 and Wave 3 consume as input,
+    # materializing the DAG explicitly. No more `|| true` workarounds.
+    finalize = _step(
+        "finalize_wave1",
+        'date -u +"%Y-%m-%dT%H:%M:%SZ wave1 ready" > ${{outputs.wave_ready}}',
+        wave_inputs={
+            "dera_root": dera.outputs.data_root,
+            "feed_root": feed.outputs.data_root,
+            "market_root": market.outputs.data_root,
+            "macro_root": macro.outputs.data_root,
+            "patents_root": patents.outputs.data_root,
+            "news_root": news.outputs.data_root,
+            "hiring_root": hiring.outputs.data_root,
+        },
+        emit_wave_ready=True,
     )
+
+    # Wave 2: derive earnings_calls from Wave 1's filings_full. Gates on
+    # finalize.wave_ready so canonical/filings_full is fully written first.
+    earnings_calls = _step(
+        "derive_earnings_calls",
+        "\n".join([
+            "python -m data.cli.derive_earnings_calls",
+            'date -u +"%Y-%m-%dT%H:%M:%SZ wave2 ready" > ${{outputs.wave_ready}}',
+        ]),
+        wave_ready_input=finalize.outputs.wave_ready,
+        emit_wave_ready=True,
+    )
+
+    # Wave 3: validation gates. Gate on earnings_calls (which itself gates
+    # on finalize) so they see the derived modality too.
     constraints = _step(  # noqa: F841
         "validate_constraints",
-        "python -m data.cli.validate_constraints || true",
+        "python -m data.cli.validate_constraints",
+        wave_ready_input=earnings_calls.outputs.wave_ready,
     )
     coverage = _step(  # noqa: F841
         "validate_modality_coverage",
-        "python -m data.cli.validate_modality_coverage || true",
+        "python -m data.cli.validate_modality_coverage",
+        wave_ready_input=earnings_calls.outputs.wave_ready,
     )
 
 

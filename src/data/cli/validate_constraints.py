@@ -15,6 +15,12 @@ import argparse
 import os
 import sys
 
+from data.observability.baseline import (
+    diff,
+    has_material_drift,
+    latest_baseline,
+    write_baseline,
+)
 from data.observability.log import emit_event
 from data.pit.engine import PITEngine
 from data.storage import get_storage
@@ -28,6 +34,8 @@ def main() -> None:
                     help="CVR gate threshold (default: 0.02 per v3 § 9.1)")
     ap.add_argument("--show-examples", type=int, default=3,
                     help="number of example violations to print per failing rule")
+    ap.add_argument("--no-diff-baseline", action="store_true",
+                    help="skip comparing against prior baseline and skip promotion")
     args = ap.parse_args()
 
     os.environ.setdefault("BWM_DATA_ROOT", ".data")
@@ -40,12 +48,23 @@ def main() -> None:
     report = runner.evaluate(entity_ids=entity_ids)
 
     # Per-rule table
-    print(f"{'rule':<48} {'sev':<5} {'module':<16} {'checks':>10} {'viols':>8} {'rate':>8}")
-    print("─" * 100)
+    print(f"{'rule':<48} {'sev':<5} {'module':<16} {'modality':<12} {'checks':>10} {'viols':>8} {'rate':>8}")
+    print("─" * 112)
     for name, result in report.per_rule.items():
         print(
             f"{name:<48} {result.severity:<5} {result.module:<16} "
+            f"{result.modality:<12} "
             f"{result.checks:>10,} {result.violations:>8,} {result.violation_rate:>8.3%}"
+        )
+
+    # Per-modality summary (hard rules only — matches gate semantics)
+    print()
+    print(f"{'modality':<16} {'checks':>10} {'viols':>8} {'cvr':>8}")
+    print("─" * 46)
+    for modality, agg in report.per_modality.items():
+        print(
+            f"{modality:<16} {agg['checks']:>10,} "
+            f"{agg['violations']:>8,} {agg['cvr']:>8.3%}"
         )
 
     # Aggregate CVR
@@ -77,6 +96,45 @@ def main() -> None:
         hard_violations=report.total_hard_violations,
         passes_gate=report.passes_gate,
     )
+    for modality, agg in report.per_modality.items():
+        emit_event(
+            "validate_constraints", modality, "modality_breakdown",
+            cvr=agg["cvr"], checks=agg["checks"], violations=agg["violations"],
+        )
+
+    # Baseline comparison + auto-promotion on pass.
+    if not args.no_diff_baseline:
+        current_payload = {
+            "cvr": report.cvr,
+            "hard_checks": report.total_hard_checks,
+            "hard_violations": report.total_hard_violations,
+            "per_modality": report.per_modality,
+        }
+        prior = latest_baseline(storage)
+        if prior is not None:
+            prior_path, prior_payload = prior
+            d = diff(prior_payload, current_payload)
+            material = has_material_drift(d)
+            emit_event(
+                "validate_constraints", "financials", "regression_diff",
+                prior_baseline=prior_path,
+                material_drift=material,
+                cvr_rel_delta=d["scalars"]["cvr"]["rel_delta"],
+                hard_checks_rel_delta=d["scalars"]["hard_checks"]["rel_delta"],
+            )
+            if material:
+                print("\n=== Δ vs prior baseline (material drift > 5%) ===")
+                for k, v in d["scalars"].items():
+                    if abs(v["rel_delta"]) > 0.05:
+                        print(f"  {k}: {v['prior']:.4f} → {v['current']:.4f} "
+                              f"(Δ {v['delta']:+.4f}, rel {v['rel_delta']:+.2%})")
+        if report.passes_gate:
+            path = write_baseline(storage, current_payload)
+            emit_event(
+                "validate_constraints", "financials", "baseline_promoted",
+                baseline_path=path,
+            )
+
     raise SystemExit(0 if report.passes_gate else 1)
 
 

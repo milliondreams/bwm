@@ -35,6 +35,7 @@ class AccountingRule:
     severity: Literal["hard", "soft"] = "hard"
     extra_filters: dict[str, str] = field(default_factory=dict)
     module: str = "bwm.accounting"
+    modality: str = "financials"
 
 
 @dataclass
@@ -42,6 +43,7 @@ class RuleResult:
     rule_name: str
     module: str
     severity: str
+    modality: str = "financials"
     checks: int = 0
     violations: int = 0
     example_violations: list[dict] = field(default_factory=list)
@@ -75,3 +77,25 @@ class ConstraintReport:
         if self.total_hard_checks == 0:
             return True
         return self.cvr <= self.cvr_threshold
+
+    @property
+    def per_modality(self) -> dict[str, dict[str, float | int]]:
+        """Aggregate hard-rule checks/violations by modality.
+
+        Soft rules are excluded so the per-modality CVR matches the same
+        semantics as the aggregate gate (which only counts hard checks).
+        """
+        out: dict[str, dict[str, float | int]] = {}
+        for r in self.per_rule.values():
+            if r.severity != "hard":
+                continue
+            row = out.setdefault(
+                r.modality, {"checks": 0, "violations": 0, "cvr": 0.0}
+            )
+            row["checks"] += r.checks
+            row["violations"] += r.violations
+        # Drop modalities with zero checks — they're noise on operator tables.
+        out = {m: row for m, row in out.items() if row["checks"] > 0}
+        for row in out.values():
+            row["cvr"] = row["violations"] / row["checks"]
+        return out

@@ -32,5 +32,6 @@ _register(AccountingRule(
     concepts=["_filing_lag_days_10k"],  # synthetic concept computed by runner
     check=lambda v: v["_filing_lag_days_10k"] <= 90,
     module="bwm.regulation",
+    modality="filings",
     extra_filters={"_form_is": "10-K"},
 ))

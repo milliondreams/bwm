@@ -19,12 +19,24 @@ import json
 import sys
 from dataclasses import asdict
 
+from data.observability.baseline import (
+    diff,
+    has_material_drift,
+    latest_baseline,
+    write_baseline,
+)
 from data.observability.log import emit_event
 from data.storage import get_storage
 from data.validation.coverage import run_coverage_checks
 
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-diff-baseline", action="store_true",
+                    help="skip comparing against prior baseline and skip promotion")
+    args = ap.parse_args()
+
     storage = get_storage()
     report = run_coverage_checks(storage)
 
@@ -67,6 +79,41 @@ def main() -> int:
         soft_failures=len(report.soft_failures),
         n_checks=len(report.results),
     )
+
+    # Baseline comparison + auto-promotion on pass. Coverage baselines live
+    # under the same state/baselines/ directory keyed by ISO timestamp; they
+    # use a `coverage` field that diff() consumes generically.
+    if not args.no_diff_baseline:
+        current_payload = {
+            "coverage": {
+                r.name: {
+                    "observed": r.observed, "passed": r.passed,
+                    "severity": r.severity,
+                }
+                for r in report.results
+            },
+        }
+        prior = latest_baseline(storage)
+        if prior is not None:
+            prior_path, prior_payload = prior
+            d = diff(prior_payload, current_payload)
+            changed = [k for k, v in d["coverage"].items() if v["changed"]]
+            emit_event(
+                "validate_modality_coverage", "all", "regression_diff",
+                prior_baseline=prior_path, changed_checks=changed,
+                material_drift=has_material_drift(d),
+            )
+            if changed:
+                print("\n=== Δ vs prior baseline ===")
+                for k in changed:
+                    v = d["coverage"][k]
+                    print(f"  {k}: {v['prior_observed']} → {v['current_observed']}")
+        if report.passes:
+            path = write_baseline(storage, current_payload)
+            emit_event(
+                "validate_modality_coverage", "all", "baseline_promoted",
+                baseline_path=path,
+            )
 
     if report.hard_failures:
         print()
