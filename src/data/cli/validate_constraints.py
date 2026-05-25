@@ -15,6 +15,7 @@ import argparse
 import os
 import sys
 
+from data.observability.log import emit_event
 from data.pit.engine import PITEngine
 from data.storage import get_storage
 from data.validation.runner import ConstraintRunner
@@ -68,6 +69,14 @@ def main() -> None:
                 for ex in result.example_violations[: args.show_examples]:
                     print(f"  - {ex}")
 
+    emit_event(
+        "validate_constraints", "financials",
+        "validation_pass" if report.passes_gate else "validation_fail",
+        cvr=report.cvr, threshold=report.cvr_threshold,
+        hard_checks=report.total_hard_checks,
+        hard_violations=report.total_hard_violations,
+        passes_gate=report.passes_gate,
+    )
     raise SystemExit(0 if report.passes_gate else 1)
 
 

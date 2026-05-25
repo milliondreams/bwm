@@ -19,6 +19,7 @@ import json
 import sys
 from dataclasses import asdict
 
+from data.observability.log import emit_event
 from data.storage import get_storage
 from data.validation.coverage import run_coverage_checks
 
@@ -51,6 +52,21 @@ def main() -> int:
     except Exception:
         # Validation reporting should never block the CLI exit code
         pass
+
+    # Emit per-check events (machine-consumable) + aggregate
+    for r in report.results:
+        emit_event(
+            "validate_modality_coverage", "all",
+            "check_pass" if r.passed else "check_fail",
+            check_name=r.name, severity=r.severity, observed=r.observed,
+        )
+    emit_event(
+        "validate_modality_coverage", "all",
+        "validation_pass" if report.passes else "validation_fail",
+        hard_failures=len(report.hard_failures),
+        soft_failures=len(report.soft_failures),
+        n_checks=len(report.results),
+    )
 
     if report.hard_failures:
         print()

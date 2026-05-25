@@ -40,6 +40,8 @@ from typing import Iterable
 import pandas as pd
 
 from data.entity.registry import EntityRegistry
+from data.observability.log import emit_event, emit_start, emit_end
+from data.observability.resources import preflight
 from data.schemas.pit import Modality
 from data.sources.edgar.archive import log_parse
 from data.sources.edgar.feed_bulk import (
@@ -52,8 +54,13 @@ from data.sources.edgar.state import WatermarkStore
 from data.storage import get_storage
 
 WM_SOURCE = "sec_edgar:feed"
+PIPELINE = "ingest_feed"
 FILINGS_MODALITY = "filings_full"  # not in Modality enum; written to canonical/filings_full
 BATCH_FLUSH_ROWS = 5_000           # flush per-CIK buffer at this size
+# Peak earnings-season Feed days are ~3 GB compressed / ~8 GB resident as
+# all-filings-of-day is buffered. 10 GB disk / 4 GB RAM is safe.
+DISK_MIN_GB = 10.0
+MEM_MIN_GB = 4.0
 
 
 def _parse_date(s: str) -> date:
@@ -179,11 +186,23 @@ def main() -> None:
         "--limit-ciks", type=int, default=0,
         help="If >0, restrict to first N CIKs (smoke / debug)",
     )
+    ap.add_argument(
+        "--skip-resource-check", action="store_true",
+        help="Bypass disk/memory pre-flight checks (use only on known-good hosts)",
+    )
     args = ap.parse_args()
     if args.end < args.start:
         raise SystemExit("--end must be >= --start")
 
     storage = get_storage()
+    # Pre-flight before slow downloads; Feed days can be 3 GB compressed and
+    # peak resident is ~8 GB while buffering all-filings-of-day.
+    if not args.skip_resource_check:
+        import tempfile
+        preflight(
+            tempfile.gettempdir(), disk_min_gb=DISK_MIN_GB, mem_min_gb=MEM_MIN_GB,
+            hint="Feed peak days are ~3GB compressed / ~8GB resident",
+        )
     registry = EntityRegistry(storage)
     reg_df = registry.load()
     ciks_all = sorted(set(reg_df["cik"].astype(str).str.zfill(10).tolist()))
@@ -196,10 +215,27 @@ def main() -> None:
     days = list(_iter_days(args.start, args.end))
     print(f"[setup] processing {len(days)} days: {days[0]} → {days[-1]}")
 
+    job_id = emit_start(
+        PIPELINE, FILINGS_MODALITY,
+        start_day=args.start.isoformat(), end_day=args.end.isoformat(),
+        n_days=len(days), n_ciks=len(keep_ciks),
+    )
+
     t_start = time.monotonic()
     total_docs = 0
     total_bytes = 0
     for i, day in enumerate(days, 1):
+        if not args.skip_resource_check:
+            import tempfile
+            try:
+                preflight(
+                    tempfile.gettempdir(), disk_min_gb=DISK_MIN_GB,
+                    mem_min_gb=MEM_MIN_GB, hint=f"Feed day {day}",
+                )
+            except RuntimeError as e:
+                emit_event(PIPELINE, FILINGS_MODALITY, "resource_exhausted",
+                           parent_event_id=job_id, day=day.isoformat(), error=str(e))
+                raise
         stats = _ingest_day(day, keep_ciks, storage, watermark)
         total_docs += stats.docs
         total_bytes += stats.download_bytes
@@ -207,6 +243,14 @@ def main() -> None:
             storage, cik="feed", accession=day.isoformat(),
             modality=FILINGS_MODALITY, status=stats.status,
             n_records=stats.docs, error_message=stats.error,
+        )
+        emit_event(
+            PIPELINE, FILINGS_MODALITY, stats.status,
+            parent_event_id=job_id, day=day.isoformat(),
+            n_filings=stats.filings, n_records=stats.docs,
+            ciks_touched=stats.ciks_touched,
+            download_bytes=stats.download_bytes, wall_seconds=stats.elapsed_s,
+            error=stats.error or None,
         )
         pace = i / max(time.monotonic() - t_start, 1e-9) * 3600  # days/hour
         eta_h = (len(days) - i) / max(pace, 1e-9)
@@ -218,9 +262,13 @@ def main() -> None:
             + (f" ERR={stats.error[:80]}" if stats.error else "")
         )
 
+    wall = time.monotonic() - t_start
+    emit_end(PIPELINE, FILINGS_MODALITY, "ok_with_records", job_id, wall,
+             n_records=total_docs, download_bytes=total_bytes,
+             n_days=len(days))
     print()
     print(
-        f"[done] {len(days)} days in {time.monotonic()-t_start:.1f}s; "
+        f"[done] {len(days)} days in {wall:.1f}s; "
         f"total docs={total_docs:,}; download={total_bytes/1e9:.2f} GB"
     )
 

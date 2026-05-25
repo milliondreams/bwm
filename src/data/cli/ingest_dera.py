@@ -42,6 +42,8 @@ from dataclasses import dataclass
 import pandas as pd
 
 from data.entity.registry import EntityRegistry
+from data.observability.log import emit_event, emit_start, emit_end
+from data.observability.resources import preflight
 from data.pit.engine import PITEngine
 from data.schemas.financial import FinancialFact
 from data.schemas.pit import Modality
@@ -56,6 +58,11 @@ from data.sources.edgar.state import WatermarkStore
 from data.storage import get_storage
 
 WM_SOURCE = "sec_edgar:dera"
+PIPELINE = "ingest_dera"
+# DERA per-quarter footprint: ~120 MB compressed download + ~600 MB unzipped
+# num.txt + ~1-2 GB pandas resident. 5 GB disk / 2 GB RAM is comfortable.
+DISK_MIN_GB = 5.0
+MEM_MIN_GB = 2.0
 _QUARTER_RE = re.compile(r"^(\d{4})[Qq]([1-4])$")
 
 
@@ -158,12 +165,24 @@ def main() -> None:
         "--limit-ciks", type=int, default=0,
         help="If >0, restrict ingest to first N CIKs (smoke / debug)",
     )
+    ap.add_argument(
+        "--skip-resource-check", action="store_true",
+        help="Bypass disk/memory pre-flight checks (use only on known-good hosts)",
+    )
     args = ap.parse_args()
 
     if (args.end.year, args.end.quarter) < (args.start.year, args.start.quarter):
         raise SystemExit("--end must be >= --start")
 
     storage = get_storage()
+    # Pre-flight: catch insufficient disk/memory BEFORE downloading 100s of MB.
+    # Bound to the temp dir so we measure the actual spool location.
+    if not args.skip_resource_check:
+        import tempfile
+        preflight(
+            tempfile.gettempdir(), disk_min_gb=DISK_MIN_GB, mem_min_gb=MEM_MIN_GB,
+            hint="DERA needs ~5GB transient disk + ~2GB RAM per quarter",
+        )
     registry = EntityRegistry(storage)
     reg_df = registry.load()
     ciks_all = sorted(set(reg_df["cik"].astype(str).str.zfill(10).tolist()))
@@ -182,10 +201,30 @@ def main() -> None:
     ]
     print(f"[setup] processing {len(quarters)} quarters: {quarters[0]} → {quarters[-1]}")
 
+    job_id = emit_start(
+        PIPELINE, "financials",
+        start_quarter=str(args.start), end_quarter=str(args.end),
+        n_quarters=len(quarters), n_ciks=len(keep_ciks),
+    )
+
     t_start = time.monotonic()
     total_rows = 0
     total_bytes = 0
     for i, q in enumerate(quarters, 1):
+        # Re-check resources each quarter so a mid-run disk fill is caught
+        # before the next 100+ MB download burns network for nothing.
+        if not args.skip_resource_check:
+            import tempfile
+            try:
+                preflight(
+                    tempfile.gettempdir(), disk_min_gb=DISK_MIN_GB,
+                    mem_min_gb=MEM_MIN_GB,
+                    hint=f"DERA quarter {q}",
+                )
+            except RuntimeError as e:
+                emit_event(PIPELINE, "financials", "resource_exhausted",
+                           parent_event_id=job_id, quarter=str(q), error=str(e))
+                raise
         stats = _ingest_quarter(q, engine, keep_ciks, watermark, storage)
         total_rows += stats.rows_written
         total_bytes += stats.download_bytes
@@ -198,6 +237,13 @@ def main() -> None:
             n_records=stats.rows_written,
             error_message=stats.error,
         )
+        emit_event(
+            PIPELINE, "financials", stats.status,
+            parent_event_id=job_id, quarter=str(q),
+            n_records=stats.rows_written, ciks_touched=stats.ciks_touched,
+            download_bytes=stats.download_bytes, wall_seconds=stats.elapsed_s,
+            error=stats.error or None,
+        )
         pace = i / max(time.monotonic() - t_start, 1e-9) * 3600  # quarters/hour
         eta_h = (len(quarters) - i) / max(pace, 1e-9)
         print(
@@ -209,9 +255,13 @@ def main() -> None:
             + (f" ERR={stats.error[:80]}" if stats.error else "")
         )
 
+    wall = time.monotonic() - t_start
+    emit_end(PIPELINE, "financials", "ok_with_records", job_id, wall,
+             n_records=total_rows, download_bytes=total_bytes,
+             n_quarters=len(quarters))
     print()
     print(
-        f"[done] {len(quarters)} quarters in {time.monotonic()-t_start:.1f}s; "
+        f"[done] {len(quarters)} quarters in {wall:.1f}s; "
         f"total rows={total_rows:,}; download={total_bytes/1e9:.2f} GB"
     )
 

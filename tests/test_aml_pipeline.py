@@ -75,3 +75,35 @@ class TestStepOutputs:
         for name, node in p.jobs.items():
             outputs = node.outputs
             assert "data_root" in outputs, f"{name} missing data_root output"
+
+
+class TestStepTimeouts:
+    """A2.5-3: every pipeline node must have an explicit wall-clock timeout
+    matching the calibrated _STEP_TIMEOUTS table. Prevents runaway jobs
+    burning a week of cluster time on AML's 7-day default.
+    """
+
+    # Expected timeouts (must match _STEP_TIMEOUTS in phase_a2_v2.py)
+    EXPECTED = {
+        "dera": 7200, "feed": 86400, "market": 3600, "macro": 1800,
+        "patents": 14400, "news": 86400, "hiring": 1800,
+        "earnings_calls": 1800, "constraints": 600, "coverage": 600,
+    }
+
+    def test_every_node_has_timeout(self):
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        for node_name, node in p.jobs.items():
+            lim = getattr(node, "limits", None)
+            assert lim is not None, f"{node_name} has no .limits"
+            assert lim.timeout is not None, f"{node_name} has no .limits.timeout"
+
+    def test_timeouts_match_expected_values(self):
+        from aml.pipelines.phase_a2_v2 import _build_pipeline
+        p = _build_pipeline()
+        for node_name, expected in self.EXPECTED.items():
+            node = p.jobs[node_name]
+            actual = node.limits.timeout
+            assert actual == expected, (
+                f"{node_name}: expected timeout {expected}s, got {actual}s"
+            )

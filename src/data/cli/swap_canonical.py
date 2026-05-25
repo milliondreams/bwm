@@ -29,6 +29,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from data.observability.log import emit_event
 from data.storage import get_storage
 from data.storage.backend import LocalStorage
 from data.validation.coverage import run_coverage_checks
@@ -107,6 +108,11 @@ def main() -> int:
             "promoted_from": v2.name,
             "archived_to": deprecated.name if (root / "canonical" / deprecated.name).exists() else None,
         }) + "\n")
+    emit_event(
+        "swap_canonical", args.modality, "swap",
+        promoted_from=v2.name, archived_to=deprecated.name,
+        skip_validation=args.skip_validation,
+    )
     print(f"[swap] done")
     return 0
 

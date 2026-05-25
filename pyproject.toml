@@ -23,6 +23,7 @@ dependencies = [
     "openai>=2.37.0",
     "torch>=2.4.0",
     "pylance>=0.21",
+    "psutil>=5.9.0",
 ]
 
 [dependency-groups]

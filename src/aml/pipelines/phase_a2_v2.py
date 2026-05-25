@@ -76,15 +76,38 @@ def _api_keys() -> dict[str, str]:
     return keys
 
 
-def _step(name: str, command_str: str, compute: str = "cpu-cluster"):
+# Per-step wall-clock timeouts (seconds), calibrated to observed pace + ~3-6x
+# safety margin so AML kills hung jobs before they burn a week of cluster
+# time. Default AML timeout is ~7 days, which is way too generous.
+_STEP_TIMEOUTS: dict[str, int] = {
+    "ingest_dera": 7200,                  # 2h — full 52-quarter ~20 min observed
+    "ingest_feed": 86400,                 # 24h — long pole; 5-8 TB download
+    "ingest_market": 3600,                # 1h — ~8 min observed for 8K tickers
+    "ingest_macro": 1800,                 # 30m — ~5 min observed
+    "ingest_patents": 14400,              # 4h — PatentsView rate-limited
+    "ingest_news": 86400,                 # 24h — GDELT ~390K slots serial
+    "ingest_hiring": 1800,                # 30m — BLS batched, <2 min observed
+    "derive_earnings_calls": 1800,        # 30m — pure CPU on existing canonical
+    "validate_constraints": 600,          # 10m — read + rule eval
+    "validate_modality_coverage": 600,    # 10m — list + per-modality sample
+}
+
+
+def _step(name: str, command_str: str, compute: str = "cpu-cluster",
+          timeout_seconds: int | None = None):
     """Build a command component and immediately invoke it as a pipeline node.
 
     AML's dsl.pipeline registers nodes when a component is *called*; the
     component returned by `command(...)` is just a definition. Calling it
     `()` produces a Node that the active pipeline context captures.
+
+    `timeout_seconds` enforces a wall-clock limit on the step. If not
+    explicitly passed, the per-step default from _STEP_TIMEOUTS is used.
     """
     env = _ingest_env()
     env_vars = {**_BASE_ENV, **_api_keys()}
+    if timeout_seconds is None:
+        timeout_seconds = _STEP_TIMEOUTS.get(name)
     component = command(
         name=name,
         display_name=name,
@@ -105,6 +128,7 @@ def _step(name: str, command_str: str, compute: str = "cpu-cluster"):
             ),
         },
         environment_variables=env_vars,
+        timeout=timeout_seconds,
     )
     # Invoke the component → registers a node in the active pipeline context.
     return component()
