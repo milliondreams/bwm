@@ -22,6 +22,7 @@ dependencies = [
     "fredapi>=0.5.2",
     "openai>=2.37.0",
     "torch>=2.4.0",
+    "pylance>=0.21",
 ]
 
 [dependency-groups]
@@ -36,3 +37,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aml", "src/training", "src/data"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: tests > a few seconds (deselect with -m 'not slow')",
+    "network: tests requiring live network (deselect with -m 'not network')",
+]

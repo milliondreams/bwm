@@ -62,8 +62,10 @@ _LEGACY_INFERRED_KEYS = (
 
 # File naming is content-agnostic: the entity_id slug becomes the partition
 # value verbatim, with characters that are awkward on filesystems mapped to "-".
-# Any entity_id matching this regex is recognized by the directory scanner.
-_ENTITY_FILE_RE = re.compile(r"^entity=(?P<eid>[A-Za-z0-9._-]+)\.parquet$")
+# The trailing extension is optional — Parquet backend reports `entity=X.parquet`
+# from `list()`; Lance backend reports `entity=X` (the `.lance` directory suffix
+# is stripped before surfacing). The regex matches either.
+_ENTITY_FILE_RE = re.compile(r"^entity=(?P<eid>[A-Za-z0-9._-]+?)(?:\.parquet)?$")
 
 
 def _backfill_v3_fields(rows: pd.DataFrame, defaults: dict) -> pd.DataFrame:

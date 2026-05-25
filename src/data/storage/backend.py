@@ -8,12 +8,23 @@ The layout under the storage root is fixed (so the PIT engine and downstream
 training code can find data without per-deployment config):
 
     raw/{source}/{ingest_date}/...                   immutable raw API pulls
-    canonical/{modality}/{partition}.parquet         normalized PIT records
-    entities/registry.parquet                        entity resolution
-    graph/{quarter}/edges.parquet                    graph snapshots
+    canonical/{modality}/{partition}                 normalized PIT records (no ext)
+    entities/registry                                entity resolution
+    graph/{quarter}/edges                            graph snapshots
+    state/edgar/{cik10}                              per-CIK watermarks
+
+The `path` strings handed to `write_table` / `read_table` are *logical* — they
+do NOT include a format suffix. Each backend appends its own suffix
+(`.parquet` for LocalStorage, `.lance` for LanceStorage). This lets the same
+PIT engine code run against either physical format.
+
+Legacy `write_parquet` / `read_parquet` methods are kept as deprecated
+aliases for callers that haven't migrated yet; they strip a trailing
+`.parquet` from the path before delegating to `write_table` / `read_table`.
 
 `get_storage()` returns LocalStorage when BWM_DATA_ROOT is set (dev), else
-AzureMLStorage targeting the workspace's default datastore (prod).
+AzureMLStorage targeting the workspace's default datastore (prod). Set
+BWM_STORAGE_BACKEND=lance to swap in the Lance backend for new ingest runs.
 """
 from __future__ import annotations
 
@@ -26,14 +37,44 @@ from typing import Iterable
 import pandas as pd
 
 
+def _strip_parquet_suffix(path: str) -> str:
+    """Legacy callers pass `foo.parquet`; new write_table API expects `foo`.
+
+    Keeping the suffix-stripping behavior on the deprecated alias means we can
+    run the existing PIT engine against either backend without a rename pass.
+    """
+    return path[:-8] if path.endswith(".parquet") else path
+
+
 class Storage(ABC):
-    """Read/write Parquet and JSON blobs under a fixed root."""
+    """Read/write tabular and binary blobs under a fixed root.
+
+    Subclasses pick the physical format for tabular data (parquet for
+    LocalStorage, Lance for LanceStorage). Logical paths passed to
+    `write_table`/`read_table` are format-suffix-free.
+    """
+
+    # ----- tabular (format-agnostic) -----
 
     @abstractmethod
-    def write_parquet(self, path: str, df: pd.DataFrame) -> None: ...
+    def write_table(self, path: str, df: pd.DataFrame) -> None:
+        """Persist a DataFrame at the logical `path` (no format suffix)."""
 
     @abstractmethod
-    def read_parquet(self, path: str) -> pd.DataFrame: ...
+    def read_table(self, path: str) -> pd.DataFrame:
+        """Read a DataFrame from the logical `path` (no format suffix)."""
+
+    # ----- legacy aliases (deprecated) -----
+
+    def write_parquet(self, path: str, df: pd.DataFrame) -> None:
+        """Deprecated. Strips `.parquet` from path and delegates to `write_table`."""
+        self.write_table(_strip_parquet_suffix(path), df)
+
+    def read_parquet(self, path: str) -> pd.DataFrame:
+        """Deprecated. Strips `.parquet` from path and delegates to `read_table`."""
+        return self.read_table(_strip_parquet_suffix(path))
+
+    # ----- binary -----
 
     @abstractmethod
     def write_bytes(self, path: str, data: bytes) -> None: ...
@@ -68,6 +109,8 @@ class Storage(ABC):
 
 
 class LocalStorage(Storage):
+    """Filesystem backend. Tabular data lands as Parquet (`{path}.parquet`)."""
+
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -78,13 +121,17 @@ class LocalStorage(Storage):
             raise ValueError(f"path escapes root: {path}")
         return p
 
-    def write_parquet(self, path: str, df: pd.DataFrame) -> None:
-        p = self._abs(path)
+    def write_table(self, path: str, df: pd.DataFrame) -> None:
+        # Auto-add .parquet if the caller didn't (new API contract). Idempotent
+        # for callers that already include the suffix via the legacy alias.
+        physical = path if path.endswith(".parquet") else f"{path}.parquet"
+        p = self._abs(physical)
         p.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(p, index=False)
 
-    def read_parquet(self, path: str) -> pd.DataFrame:
-        return pd.read_parquet(self._abs(path))
+    def read_table(self, path: str) -> pd.DataFrame:
+        physical = path if path.endswith(".parquet") else f"{path}.parquet"
+        return pd.read_parquet(self._abs(physical))
 
     def write_bytes(self, path: str, data: bytes) -> None:
         p = self._abs(path)
@@ -101,7 +148,14 @@ class LocalStorage(Storage):
         return self._abs(path).read_bytes()
 
     def exists(self, path: str) -> bool:
-        return self._abs(path).exists()
+        # Existence checks happen against the logical path. We honor either
+        # `foo` (new) or `foo.parquet` (legacy) so the check works regardless
+        # of which API the caller used.
+        if self._abs(path).exists():
+            return True
+        if not path.endswith(".parquet"):
+            return self._abs(f"{path}.parquet").exists()
+        return False
 
     def list(self, prefix: str) -> Iterable[str]:
         base = self._abs(prefix)
@@ -131,11 +185,13 @@ class AzureMLStorage(Storage):
 
         return fsspec.filesystem("azureml")
 
-    def write_parquet(self, path: str, df: pd.DataFrame) -> None:
-        df.to_parquet(self._fs_path(path), index=False, storage_options={})
+    def write_table(self, path: str, df: pd.DataFrame) -> None:
+        physical = path if path.endswith(".parquet") else f"{path}.parquet"
+        df.to_parquet(self._fs_path(physical), index=False, storage_options={})
 
-    def read_parquet(self, path: str) -> pd.DataFrame:
-        return pd.read_parquet(self._fs_path(path), storage_options={})
+    def read_table(self, path: str) -> pd.DataFrame:
+        physical = path if path.endswith(".parquet") else f"{path}.parquet"
+        return pd.read_parquet(self._fs_path(physical), storage_options={})
 
     def write_bytes(self, path: str, data: bytes) -> None:
         with self._fs().open(self._fs_path(path), "wb") as f:
@@ -159,18 +215,45 @@ class AzureMLStorage(Storage):
             return f.read()
 
     def exists(self, path: str) -> bool:
-        return self._fs().exists(self._fs_path(path))
+        if self._fs().exists(self._fs_path(path)):
+            return True
+        if not path.endswith(".parquet"):
+            return self._fs().exists(self._fs_path(f"{path}.parquet"))
+        return False
 
     def list(self, prefix: str) -> Iterable[str]:
         return self._fs().ls(self._fs_path(prefix), detail=False)
 
 
 def get_storage() -> Storage:
-    """Pick a backend based on env. BWM_DATA_ROOT wins (dev); else use AzureML."""
+    """Pick a backend based on env vars.
+
+    BWM_STORAGE_BACKEND=lance selects LanceStorage for new ingest writes. The
+    default ("parquet" or unset) preserves LocalStorage / AzureMLStorage
+    behavior so existing canonical data keeps working without migration.
+
+    BWM_DATA_ROOT (local dev) wins over BWM_DATASTORE_URI (azureml prod) when
+    both are set.
+    """
+    backend = os.environ.get("BWM_STORAGE_BACKEND", "parquet").lower()
     local = os.environ.get("BWM_DATA_ROOT")
+
+    if backend == "lance":
+        # Lazy import — only required when actually using the Lance backend.
+        from data.storage.lance_backend import LanceStorage
+
+        if local:
+            return LanceStorage(local)
+        uri = os.environ.get("BWM_DATASTORE_URI")
+        if not uri:
+            raise RuntimeError(
+                "BWM_STORAGE_BACKEND=lance requires BWM_DATA_ROOT (local) "
+                "or BWM_DATASTORE_URI (azureml://...)"
+            )
+        return LanceStorage(uri)
+
     if local:
         return LocalStorage(local)
-
     uri = os.environ.get("BWM_DATASTORE_URI")
     if not uri:
         raise RuntimeError(
